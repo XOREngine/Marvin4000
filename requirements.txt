@@ -1,0 +1,31 @@
+# Marvin4000 - Real-time Audio Transcription & Translation
+# © 2025 XOREngine (WallyByte)
+# https://github.com/XOREngine/marvin4000
+
+# Core ML libraries
+torch
+transformers
+bitsandbytes
+
+# Audio processing
+numpy
+scipy
+soundfile
+sounddevice
+webrtcvad
+
+# Tokenizers and model processing
+tiktoken
+protobuf
+sentencepiece
+
+# Evaluation metrics
+jiwer
+
+# Optional: for better performance
+accelerate
+xformers
+
+# System requirements (Linux)
+# Note: Install separately on your system:
+# sudo apt install pulseaudio-utils ffmpeg
