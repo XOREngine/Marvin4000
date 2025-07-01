@@ -34,7 +34,7 @@ from transformers import AutoProcessor, SeamlessM4Tv2Model
 
 CACHE_DIR          = Path("./models_cache")
 ASR_MODEL          = "openai/whisper-large-v3-turbo" 
-NMT_MODEL          = "facebook/seamless-m4t-v2-large"
+NMT_MODEL          = "facebook/nllb-200-3.3B"
 DEVICE             = "cuda" if torch.cuda.is_available() else "cpu"
 USE_HALF           = DEVICE == "cuda"
 
@@ -61,12 +61,12 @@ MIN_CUT_DURATION_SEC = 2.5      # Minimum audio duration before cut
 REUSE_THRESHOLD    = 0.95 
 MAX_CACHE_SIZE     = 50   
 
-# Langs  
+# Langs
 # Whisper: en, es, de, fr, it, pt, ru, ja, ko, zh, ar, hi, ...
-# SeamlessM4T: eng, spa, fra, deu, ita, por, rus, tur, pol, ces, nld, ukr, kor, jpn, zho, arb, etc.
+# NLLB: eng_Latn, spa_Latn, deu_Latn, fra_Latn, ita_Latn, por_Latn, rus_Cyrl, jpn_Jpan, kor_Hang, zho_Hans, arb_Arab, hin_Deva, ...
 ASR_SOURCE_LANG = "en"          
-NMT_SOURCE_LANG = "eng"    
-NMT_TARGET_LANG = "spa"
+NMT_SOURCE_LANG = "eng_Latn"    
+NMT_TARGET_LANG = "spa_Latn" 
 
 GREEN              = "\033[32m"
 RESET              = "\033[0m"
@@ -101,7 +101,6 @@ def text_similarity(text1: str, text2: str) -> float:
     common = words1.intersection(words2)
     return len(common) / max(len(words1), len(words2))
 
-# Producer
 class AudioProducer(threading.Thread):
     def __init__(self, q: queue.Queue[np.ndarray], audio_device: str):
         super().__init__(daemon=True)
@@ -135,7 +134,6 @@ class AudioProducer(threading.Thread):
             log("Producer stopped")
 
 
-# Transcriber and Translator
 class Transcriber(threading.Thread):
     def __init__(self, q: queue.Queue[np.ndarray]):
         super().__init__(daemon=True)
@@ -172,11 +170,37 @@ class Transcriber(threading.Thread):
         # log("ASR model loaded: 8bit quantized")
 
 
-        # SEAMLESSM4T NMT
+        # NLLB NMT
         log(f"Loading NMT model: {NMT_MODEL}")
-        self.nmt_processor = AutoProcessor.from_pretrained(NMT_MODEL)
-        self.nmt_model = SeamlessM4Tv2Model.from_pretrained(NMT_MODEL).to(DEVICE)
+        self.nmt_tokenizer = AutoTokenizer.from_pretrained(NMT_MODEL, cache_dir=CACHE_DIR)
+        
+        self.nmt_tokenizer.src_lang = NMT_SOURCE_LANG
+        self.nmt_tokenizer.pad_token = self.nmt_tokenizer.unk_token
+        self.nmt_tokenizer.pad_token_id = self.nmt_tokenizer.unk_token_id
+        
+        # === 16bit (default) ===
+        self.nmt_model = AutoModelForSeq2SeqLM.from_pretrained(
+            NMT_MODEL,
+            cache_dir=CACHE_DIR,
+            torch_dtype=torch.float16, 
+            load_in_8bit=False,
+            device_map="auto"
+        ).to(DEVICE)
         log("NMT model loaded: 16bit")
+        
+        # === 8bit quantization (uncomment to use) ===
+        # quant_nmt = BitsAndBytesConfig(load_in_8bit=True, llm_int8_threshold=6.0)
+        # self.nmt_model = AutoModelForSeq2SeqLM.from_pretrained(
+        #     NMT_MODEL,
+        #     cache_dir=CACHE_DIR,
+        #     quantization_config=quant_nmt,
+        #     device_map="auto"
+        # )
+        # log("NMT model loaded: 8bit quantized")
+
+
+        self.nmt_model.resize_token_embeddings(len(self.nmt_tokenizer))
+        self.nmt_model.eval()  
 
         # Fixed language config
         self.src_lang = NMT_SOURCE_LANG
@@ -212,7 +236,6 @@ class Transcriber(threading.Thread):
         attn   = torch.ones(feats.shape[:-1], device=DEVICE, dtype=torch.long)
         forced = self.asr_processor.get_decoder_prompt_ids(language=ASR_SOURCE_LANG, task="transcribe")
         with gpu_lock, torch.inference_mode():
-
             gen = self.asr_model.generate(
                 feats,
                 attention_mask=attn,
@@ -248,30 +271,36 @@ class Transcriber(threading.Thread):
                 return cached_translation
 
         try:
-            inputs = self.nmt_processor(
-                text=txt.strip(),
-                src_lang=self.src_lang,
-                return_tensors="pt"
-            )
+            src_texts = [txt.strip()]
             
-            inputs = {k: v.to(DEVICE) if hasattr(v, 'to') else v for k, v in inputs.items()}
-
-            with gpu_lock, torch.no_grad():
+            inputs = self.nmt_tokenizer(
+                src_texts, 
+                return_tensors="pt", 
+                padding=True,              
+                max_length=64,             
+                truncation=True
+            ).to(DEVICE)
+            
+           
+            with gpu_lock, torch.inference_mode():
+                forced_bos_token_id = self.nmt_tokenizer.convert_tokens_to_ids(self.tgt_lang)
+              
                 generated_tokens = self.nmt_model.generate(
                     **inputs,
-                    tgt_lang=self.tgt_lang,
-                    generate_speech=False,
-                    max_new_tokens=140,
-                    num_beams=5,
-                    do_sample=False,
-                    repetition_penalty=1.02,
-                    length_penalty=1.25,
-                    early_stopping=False,
-                    no_repeat_ngram_size=4,
-                    use_cache=True
+                    forced_bos_token_id=forced_bos_token_id,
+                    max_length=120,              
+                    min_length=8,                
+                    num_beams=4,                 
+                    do_sample=False,             
+                    repetition_penalty=1.1,      
+                    no_repeat_ngram_size=2,      
+                    early_stopping=True,         
                 )
-
-            translation = self.nmt_processor.batch_decode(generated_tokens.sequences, skip_special_tokens=True)[0]
+                
+            translation = self.nmt_tokenizer.batch_decode(
+                generated_tokens, 
+                skip_special_tokens=True
+            )[0]
 
             translation = re.sub(r'\s+([.,!?])', r'\1', translation)
             translation = re.sub(r'\.{2,}', '.', translation)
@@ -287,7 +316,7 @@ class Transcriber(threading.Thread):
             return translation
 
         except Exception as e:
-            log(f"Error in M4T translation: {str(e)}")
+            log(f"Error in NLLB translation: {str(e)}")
             return None
 
 
@@ -397,11 +426,11 @@ class Transcriber(threading.Thread):
 
 # Main
 def main():
-    parser = argparse.ArgumentParser(description="Marvin4000 - Real-time speech transcription and translation")
+    parser = argparse.ArgumentParser(description="Marvin4000 - Real-time speech to text transcription and translation")
     parser.add_argument("--audio-device", required=True, help="Audio device name (e.g., 'alsa_output.device.monitor')")
     parser.add_argument("--asr-lang", default="en", help="ASR source language (Whisper. default: en)")
-    parser.add_argument("--nmt-source", default="eng", help="NMT source language (SeamlessM4T. default: eng)") 
-    parser.add_argument("--nmt-target", default="spa", help="NMT target language (SeamlessM4T. default: spa)") 
+    parser.add_argument("--nmt-source", default="eng_Latn", help="NMT source language (NLLB. default: eng_Latn)")
+    parser.add_argument("--nmt-target", default="spa_Latn", help="NMT target language (NLLB. default: spa_Latn)")
     args = parser.parse_args()
 
     # Override global variables
