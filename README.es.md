@@ -27,14 +27,15 @@
 ## 📊 Rendimiento probado
 
 | GPU & Modelos usados                                                | Latencia (s) | WER       | BLEU-1/4/Corpus | VRAM        |
-| ------------------------------------------------------------------- | ------------ | --------- | --------------- | ----------- |
-| **RTX 4060 Ti 16GB<br>whisper-large-v3 (8b), seamless-m4t-v2-large** | **2-3**      | **5 %** | **74/39/52**    | **12.2 GB** |
+| ---------------------------------------------------------------- | ----------- | --------- | --------------- | ----------- |
+| **RTX 4060 Ti 16GB<br>whisper-large-v3-turbo + nllb-200-3.3B** | **2-3**     | **6 %** | **75/38/54**    | **14.2 GB** |
+| RTX 4060 Ti 16GB<br>whisper-large-v3-turbo + seamless-m4t-v2-large | 2-3     | 6 % | 74/39/52    | 11.4 GB |
 
 #### Corpus de prueba
 
 * **Audio**: 25 fragmentos aleatorios de audiolibros de [LibriSpeech](https://www.openslr.org/12) (media: 5 min/fragmento)
 * **Transcripción de referencia**: Transcripciones oficiales de LibriSpeech
-* **Traducción de referencia**: Generada con Claude & GPT y revisada manualmente
+* **Traducción de referencia**: Generada con Claude & GPT y revisada manualmente (Inglés → Español)
 * **Total evaluado**: \~120 minutos de audio
 
 #### Cálculo de métricas
@@ -76,6 +77,8 @@ python detect_audio_devices.py
 
 # 3. Iniciar transcripción/traducción con el dispositivo monitor adecuado
 python marvin4000_seam.py --audio-device "alsa_output.pci-0000_00_1f.3.analog-stereo.monitor"
+
+python marvin4000_nllb.py --audio-device "alsa_output.pci-0000_00_1f.3.analog-stereo.monitor" --asr-lang "de" --nmt-source "deu_Latn" --nmt-target "spa_Latn"
 ```
 
 ### Configuración de idiomas
@@ -131,21 +134,19 @@ gen = self.asr.generate(
 )
 ```
 
-**Inferencia NMT (SeamlessM4T):**
+**Inferencia NMT (NLLB-200):**
 
 ```python
 generated_tokens = self.nmt_model.generate(
     **inputs,
-    tgt_lang=self.tgt_lang,
-    generate_speech=False,
-    max_new_tokens=140,
-    num_beams=5,
-    do_sample=False,
-    repetition_penalty=1.02,
-    length_penalty=1.25,
-    early_stopping=False,
-    no_repeat_ngram_size=4,
-    use_cache=True
+    forced_bos_token_id=forced_bos_token_id,
+    max_length=120,              
+    min_length=8,                
+    num_beams=4,                 
+    do_sample=False,             
+    repetition_penalty=1.1,      
+    no_repeat_ngram_size=2,      
+    early_stopping=True,         
 )
 ```
 
